@@ -159,6 +159,6 @@ class TestEirPipeline:
         # Check that backups exist
         import glob
         backup_dir = Path(eir_config.backup_dir)
-        mimir_backups = list(backup_dir.glob("mimir_*.py"))
+        mimir_backups = list(backup_dir.glob("mimir_*.db"))
         assert len(mimir_backups) >= 1
         pipeline.close()

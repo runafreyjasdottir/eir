@@ -293,7 +293,7 @@ class EirPipeline:
         mimir_path = Path(self.config.mimir_db_path).expanduser()
         if mimir_path.exists():
             try:
-                dest = backup_dir / f"mimir_{timestamp}.py"
+                dest = backup_dir / f"mimir_{timestamp}.db"
                 shutil.copy2(mimir_path, dest)
                 results["backups"].append(str(dest))
             except Exception as e:
@@ -316,7 +316,7 @@ class EirPipeline:
 
     def _rotate_backups(self, backup_dir: Path):
         """Remove old backups beyond max_backups per type."""
-        for pattern in ["mimir_*.py", "muninn_*.db"]:
+        for pattern in ["mimir_*.db", "muninn_*.db"]:
             backups = sorted(backup_dir.glob(pattern))
             while len(backups) > self.config.max_backups:
                 oldest = backups.pop(0)
@@ -402,3 +402,7 @@ class EirPipeline:
         if self._muninn:
             self._muninn.close()
             self._muninn = None
+        if self._huginn:
+            if hasattr(self._huginn, 'close'):
+                self._huginn.close()
+            self._huginn = None

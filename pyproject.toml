@@ -11,6 +11,8 @@ dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov"]
+muninn = ["muninn"]
+huginn = ["huginn"]
 
 [build-system]
 requires = ["setuptools>=68.0", "wheel"]
