@@ -3,9 +3,12 @@ Eir Core — Consolidation Pipeline
 ====================================
 Orchestrates memory maintenance: decay, promotion, dedup,
 consolidation, backup, and integrity verification.
+
+Now config-driven through effort levels and layer flags.
+Like a völva choosing which threads to read at the Well,
+Eir selects only the checks the situation requires.
 """
 
-import json
 import logging
 import shutil
 import sqlite3
@@ -14,6 +17,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import EirConfig, get_config
+from .layers import (
+    CHECK_REGISTRY,
+    EffortLevel,
+    LayerConfig,
+    TaskComplexity,
+)
+from .router import EffortRouter, ModelRouter
 
 logger = logging.getLogger("eir.core")
 
@@ -40,6 +50,12 @@ class EirPipeline:
         self._mimir_conn = None
         self._muninn = None
         self._huginn = None
+        self.effort_router = EffortRouter(
+            config_path=Path(self.config.config_path) if self.config.config_path else None
+        )
+        self.model_router = ModelRouter()
+
+    # ─── Backend Accessors ─────────────────────────────────────────────
 
     def _get_mimir(self) -> Optional[sqlite3.Connection]:
         """Get Mímir's Well connection."""
@@ -73,15 +89,48 @@ class EirPipeline:
                 logger.warning("Eir: Huginn not available: %s", e)
         return self._huginn
 
-    # ─── Main Pipeline ────────────────────────────────────────────────────
+    # ─── Layer-Aware Execution ──────────────────────────────────────────
 
-    def run(self) -> Dict[str, Any]:
-        """Run the full consolidation pipeline.
+    def _should_run(self, check_name: str, active_checks: Dict[str, List[str]]) -> bool:
+        """Check if a given check is in the active set for this run."""
+        for layer_checks in active_checks.values():
+            if check_name in layer_checks:
+                return True
+        return False
+
+    # ─── Main Pipeline ──────────────────────────────────────────────────
+
+    def run(
+        self,
+        effort: Optional[EffortLevel] = None,
+        active_checks: Optional[Dict[str, List[str]]] = None,
+    ) -> Dict[str, Any]:
+        """Run the consolidation pipeline with layer-aware routing.
         
-        Returns a summary of all operations performed.
+        Args:
+            effort: Override effort level. If None, the router decides.
+            active_checks: Override which checks to run. If None, 
+                          the effort level determines the checks.
+        
+        Returns:
+            Summary of all operations performed.
         """
+        # Resolve effort level
+        if effort is None:
+            effort = EffortLevel(self.config.effort_level)
+        
+        # Resolve active checks from effort level
+        if active_checks is None:
+            active_checks = self.effort_router.resolve_checks(effort)
+        
+        # Plan model assignments for AI-assisted checks
+        model_plan = self.model_router.plan_run(active_checks)
+
         results = {
             "timestamp": datetime.now().isoformat(),
+            "effort_level": effort.value,
+            "active_checks": active_checks,
+            "model_plan": model_plan,
             "decay": {},
             "promotion": {},
             "dedup": {},
@@ -90,39 +139,53 @@ class EirPipeline:
             "integrity": {},
         }
 
-        logger.info("Eir: Starting consolidation pipeline")
+        logger.info(
+            "Eir: Starting consolidation pipeline [effort=%s, checks=%d]",
+            effort.value,
+            sum(len(v) for v in active_checks.values()),
+        )
 
         # 1. Decay
-        if self.config.decay_enabled:
+        if self._should_run("decay", active_checks):
             results["decay"] = self.decay()
             logger.info("Eir: Decay — %s", results["decay"])
 
         # 2. Promotion
-        if self.config.promotion_enabled:
+        if self._should_run("promotion", active_checks):
             results["promotion"] = self.promote()
             logger.info("Eir: Promotion — %s", results["promotion"])
 
         # 3. Deduplication
-        if self.config.dedup_enabled:
+        if self._should_run("dedup", active_checks):
             results["dedup"] = self.deduplicate()
             logger.info("Eir: Dedup — %s", results["dedup"])
 
         # 4. Consolidation
-        if self.config.consolidation_enabled:
+        if self._should_run("consolidation", active_checks):
             results["consolidation"] = self.consolidate()
             logger.info("Eir: Consolidation — %s", results["consolidation"])
 
         # 5. Backup
-        if self.config.backup_enabled:
+        if self._should_run("backup_verify", active_checks):
             results["backup"] = self.backup()
             logger.info("Eir: Backup — %s", results["backup"])
 
         # 6. Integrity check
-        if self.config.integrity_check_enabled:
+        if self._should_run("integrity", active_checks):
             results["integrity"] = self.integrity_check()
             logger.info("Eir: Integrity — %s", results["integrity"])
 
-        logger.info("Eir: Consolidation pipeline complete")
+        logger.info("Eir: Consolidation pipeline complete [%s]", effort.value)
+
+        # Record the run for future routing
+        errors = []
+        for section in ["decay", "promotion", "dedup", "consolidation", "backup", "integrity"]:
+            if isinstance(results.get(section), dict):
+                for key, val in results[section].items():
+                    if isinstance(val, dict) and "error" in val:
+                        errors.append(f"{section}.{key}: {val['error']}")
+        self.effort_router.record_run(effort, errors)
+
         return results
 
     # ─── Individual Operations ────────────────────────────────────────────
@@ -282,6 +345,8 @@ class EirPipeline:
         
         Eir protects the archive — like a guardian at Lyfjaberg,
         she ensures nothing of value is lost to corruption or time.
+        
+        BUG FIX: Now correctly backs up .db files, not .py source files.
         """
         results = {"backups": [], "errors": []}
 
@@ -289,15 +354,21 @@ class EirPipeline:
         backup_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Backup Mímir
+        # Backup Mímir — the actual database, not the source module
         mimir_path = Path(self.config.mimir_db_path).expanduser()
-        if mimir_path.exists():
+        if mimir_path.exists() and mimir_path.suffix == ".db":
             try:
                 dest = backup_dir / f"mimir_{timestamp}.db"
                 shutil.copy2(mimir_path, dest)
                 results["backups"].append(str(dest))
             except Exception as e:
                 results["errors"].append(f"Mímir backup: {e}")
+        elif not mimir_path.exists():
+            pass  # Skip silently —没什么可备份的
+        else:
+            results["errors"].append(
+                f"Mímir path is not a database: {mimir_path} (suffix={mimir_path.suffix})"
+            )
 
         # Backup Muninn
         muninn_path = Path(self.config.muninn_db_path).expanduser()
@@ -309,6 +380,16 @@ class EirPipeline:
             except Exception as e:
                 results["errors"].append(f"Muninn backup: {e}")
 
+        # Backup Runa Memory (the actual live DB)
+        runa_memory_path = Path.home() / ".hermes" / "memory" / "runa_memory.db"
+        if runa_memory_path.exists():
+            try:
+                dest = backup_dir / f"runa_memory_{timestamp}.db"
+                shutil.copy2(runa_memory_path, dest)
+                results["backups"].append(str(dest))
+            except Exception as e:
+                results["errors"].append(f"Runa memory backup: {e}")
+
         # Rotate old backups
         self._rotate_backups(backup_dir)
 
@@ -316,7 +397,7 @@ class EirPipeline:
 
     def _rotate_backups(self, backup_dir: Path):
         """Remove old backups beyond max_backups per type."""
-        for pattern in ["mimir_*.db", "muninn_*.db"]:
+        for pattern in ["mimir_*.db", "muninn_*.db", "runa_memory_*.db"]:
             backups = sorted(backup_dir.glob(pattern))
             while len(backups) > self.config.max_backups:
                 oldest = backups.pop(0)
@@ -335,7 +416,7 @@ class EirPipeline:
         if mimir:
             try:
                 # Check FTS integrity
-                fts_check = mimir.execute(
+                mimir.execute(
                     "INSERT INTO memories_fts(memories_fts) VALUES('integrity-check')"
                 )
                 mimir.commit()
@@ -382,8 +463,11 @@ class EirPipeline:
 
     def health(self) -> Dict[str, Any]:
         """Quick health check of the Eir pipeline."""
+        # Quick always uses just integrity check
+        active_checks = self.effort_router.resolve_checks(EffortLevel.QUICK)
         return {
             "status": "healthy",
+            "effort_level": self.config.effort_level,
             "config": {
                 "decay_enabled": self.config.decay_enabled,
                 "promotion_enabled": self.config.promotion_enabled,
@@ -391,6 +475,7 @@ class EirPipeline:
                 "consolidation_enabled": self.config.consolidation_enabled,
                 "backup_enabled": self.config.backup_enabled,
             },
+            "active_checks": active_checks,
             "backends": self.integrity_check(),
         }
 

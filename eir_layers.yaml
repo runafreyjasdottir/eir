@@ -1,0 +1,97 @@
+# Eir Layers — Default Configuration
+# ======================================
+# Feature flags for diagnostic/maintenance layers.
+# Like the nine worlds of Yggdrasil, each layer has its own depth.
+# The effort router reads these to determine what to run.
+
+effort_levels:
+  quick:
+    description: "Fast daily pulse — integrity checks only, no mutations"
+    max_duration: 30
+    layers:
+      mimir:
+        enabled: true
+        checks: [integrity]
+      huginn:
+        enabled: true
+        checks: [collections]
+      muninn:
+        enabled: false
+      kista:
+        enabled: true
+        checks: [vault_integrity]
+      nervus:
+        enabled: false
+
+  standard:
+    description: "Standard daily — core maintenance + integrity"
+    max_duration: 120
+    layers:
+      mimir:
+        enabled: true
+        checks: [integrity, decay, dedup]
+      huginn:
+        enabled: true
+        checks: [collections, embedder]
+      muninn:
+        enabled: true
+        checks: [health]
+      kista:
+        enabled: true
+        checks: [vault_integrity, backup_verify]
+      nervus:
+        enabled: true
+        checks: [socket, feed]
+
+  deep:
+    description: "Deep weekly — full pipeline including semantic operations"
+    max_duration: 600
+    layers:
+      mimir:
+        enabled: true
+        checks: [integrity, decay, promotion, dedup, fts_rebuild, orphan_cleanup]
+      huginn:
+        enabled: true
+        checks: [collections, embedder, vectors, reindex]
+      muninn:
+        enabled: true
+        checks: [health, consolidation, hebbian_decay]
+      kista:
+        enabled: true
+        checks: [vault_integrity, key_rotation, backup_verify]
+      nervus:
+        enabled: true
+        checks: [socket, feed, impulse_count, latency]
+
+  emergency:
+    description: "Everything — used when diagnosing failures"
+    max_duration: 0  # no limit
+    layers:
+      mimir:
+        enabled: true
+        checks: [integrity, decay, promotion, dedup, fts_rebuild, orphan_cleanup]
+      huginn:
+        enabled: true
+        checks: [collections, embedder, vectors, reindex]
+      muninn:
+        enabled: true
+        checks: [health, consolidation, hebbian_decay]
+      kista:
+        enabled: true
+        checks: [vault_integrity, key_rotation, backup_verify]
+      nervus:
+        enabled: true
+        checks: [socket, feed, impulse_count, latency]
+
+# Model routing for AI-assisted checks.
+# Most Eir checks are pure logic (no AI needed).
+# Only promotion, consolidation, and semantic dedup benefit from models.
+model_router:
+  # Per-check model overrides (optional)
+  overrides: {}
+  
+  # Available models (populated at runtime from Hermes config)
+  # available_models: []  # uncomment to restrict
+
+  # Default fallback model
+  fallback: "glm-5.1"
