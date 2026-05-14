@@ -56,6 +56,13 @@ class EirConfig:
     dedup_enabled: bool = True
     dedup_similarity_threshold: float = 0.85  # Cosine similarity for dedup
     
+    # ─── Compression Settings (T5-4) ──────────────────────────────────
+    compress_enabled: bool = True
+    compress_min_importance: int = 1      # Only compress importance ≤ this
+    compress_max_importance: int = 6       # Never compress importance > this
+    compress_min_cluster_size: int = 3     # Need 3+ similar memories to compress
+    compress_window_days: int = 7          # Cluster within 7-day windows
+    
     # ─── Consolidation Settings ─────────────────────────────────────────
     consolidation_enabled: bool = True
     consolidation_strength_threshold: float = 0.6  # Muninn strength for consolidation

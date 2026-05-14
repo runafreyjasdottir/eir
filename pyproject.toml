@@ -1,6 +1,6 @@
 [project]
 name = "eir"
-version = "1.0.0"
+version = "2.1.0"
 description = "Eir — Consolidation Pipeline for AI memory systems"
 readme = "README.md"
 requires-python = ">=3.10"

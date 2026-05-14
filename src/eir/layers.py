@@ -41,6 +41,7 @@ CHECK_REGISTRY: Dict[str, Dict[str, Any]] = {
     "decay":           {"layer": "mimir",  "cost": 0.3, "complexity": TaskComplexity.DIAGNOSTIC},
     "promotion":       {"layer": "mimir",  "cost": 0.5, "complexity": TaskComplexity.REASONING},
     "dedup":           {"layer": "mimir",  "cost": 0.4, "complexity": TaskComplexity.SEMANTIC},
+    "compress":        {"layer": "mimir",  "cost": 0.6, "complexity": TaskComplexity.REASONING},
     "fts_rebuild":     {"layer": "mimir",  "cost": 0.2, "complexity": TaskComplexity.DIAGNOSTIC},
     "orphan_cleanup":  {"layer": "mimir",  "cost": 0.2, "complexity": TaskComplexity.DIAGNOSTIC},
 
@@ -131,7 +132,7 @@ STANDARD_PROFILE = EffortProfile(
     description="Standard daily — core maintenance + integrity",
     max_duration=120,
     layers={
-        "mimir": LayerConfig(enabled=True, checks=["integrity", "decay", "dedup"]),
+        "mimir": LayerConfig(enabled=True, checks=["integrity", "decay", "dedup", "compress"]),
         "huginn": LayerConfig(enabled=True, checks=["collections", "embedder"]),
         "muninn": LayerConfig(enabled=True, checks=["health"]),
         "kista": LayerConfig(enabled=True, checks=["vault_integrity", "backup_verify"]),
@@ -145,7 +146,7 @@ DEEP_PROFILE = EffortProfile(
     max_duration=600,
     layers={
         "mimir": LayerConfig(enabled=True, checks=[
-            "integrity", "decay", "promotion", "dedup", "fts_rebuild", "orphan_cleanup"
+            "integrity", "decay", "promotion", "dedup", "compress", "fts_rebuild", "orphan_cleanup"
         ]),
         "huginn": LayerConfig(enabled=True, checks=["collections", "embedder", "vectors", "reindex"]),
         "muninn": LayerConfig(enabled=True, checks=["health", "consolidation", "hebbian_decay"]),
@@ -160,7 +161,7 @@ EMERGENCY_PROFILE = EffortProfile(
     max_duration=0,  # no limit
     layers={
         "mimir": LayerConfig(enabled=True, checks=[
-            "integrity", "decay", "promotion", "dedup", "fts_rebuild", "orphan_cleanup"
+            "integrity", "decay", "promotion", "dedup", "compress", "fts_rebuild", "orphan_cleanup"
         ]),
         "huginn": LayerConfig(enabled=True, checks=["collections", "embedder", "vectors", "reindex"]),
         "muninn": LayerConfig(enabled=True, checks=["health", "consolidation", "hebbian_decay"]),

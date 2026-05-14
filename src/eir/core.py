@@ -134,6 +134,7 @@ class EirPipeline:
             "decay": {},
             "promotion": {},
             "dedup": {},
+            "compress": {},
             "consolidation": {},
             "backup": {},
             "integrity": {},
@@ -160,6 +161,11 @@ class EirPipeline:
             results["dedup"] = self.deduplicate()
             logger.info("Eir: Dedup — %s", results["dedup"])
 
+        # 3.5. Compression (T5-4)
+        if self._should_run("compress", active_checks):
+            results["compress"] = self.compress()
+            logger.info("Eir: Compress — %s", results["compress"])
+
         # 4. Consolidation
         if self._should_run("consolidation", active_checks):
             results["consolidation"] = self.consolidate()
@@ -179,7 +185,7 @@ class EirPipeline:
 
         # Record the run for future routing
         errors = []
-        for section in ["decay", "promotion", "dedup", "consolidation", "backup", "integrity"]:
+        for section in ["decay", "promotion", "dedup", "compress", "consolidation", "backup", "integrity"]:
             if isinstance(results.get(section), dict):
                 for key, val in results[section].items():
                     if isinstance(val, dict) and "error" in val:
@@ -294,10 +300,9 @@ class EirPipeline:
                 results["groups_found"] += 1
 
                 # Keep the highest importance, delete the rest
+                placeholders = ",".join("?" * len(ids))
                 keepers = mimir.execute(
-                    "SELECT id FROM memories WHERE id IN ({}) ORDER BY importance DESC, id ASC LIMIT 1".format(
-                        ",".join("?" * len(ids))
-                    ),
+                    f"SELECT id FROM memories WHERE id IN ({placeholders}) ORDER BY importance DESC, id ASC LIMIT 1",
                     ids,
                 ).fetchall()
 
@@ -305,6 +310,11 @@ class EirPipeline:
                     keep_id = keepers[0]["id"]
                     delete_ids = [i for i in ids if i != keep_id]
                     for did in delete_ids:
+                        # Delete from FTS first (avoid trigger issues with content-sync)
+                        try:
+                            mimir.execute("DELETE FROM memories_fts WHERE rowid = ?", (did,))
+                        except Exception:
+                            pass  # FTS row may not exist for all entries
                         mimir.execute("DELETE FROM memories WHERE id = ?", (did,))
                     results["merged"] += len(delete_ids)
 
@@ -313,6 +323,187 @@ class EirPipeline:
             results["errors"].append(str(e))
 
         return results
+
+    # ── T5-4: Memory Compression ──────────────────────────────────────────
+
+    def compress(self) -> Dict[str, Any]:
+        """Compress clusters of similar low-importance episodic memories.
+
+        Like a völva condensing overlapping visions into a single prophecy,
+        Eir groups memories that echo each other and replaces them with
+        a compact semantic summary — preserving meaning, reducing noise.
+
+        Guardrails:
+        - Never compress importance >= 7 (core memories)
+        - Only compress episodic memories (never semantic/procedural)
+        - Keep originals with is_current=0 (recoverable)
+        - Log each compression for auditability
+        """
+        import json as json_module
+        results = {"clusters_found": 0, "compressed": 0, "memories_merged": 0, "errors": []}
+
+        mimir = self._get_mimir()
+        if not mimir:
+            results["errors"].append("Mímir not available")
+            return results
+
+        try:
+            clusters = self._find_compression_candidates(mimir)
+            results["clusters_found"] = len(clusters)
+
+            for cluster_key, memories in clusters.items():
+                if len(memories) < self.config.compress_min_cluster_size:
+                    continue  # Need minimum cluster size
+
+                # Guardrail: never compress if any memory has importance >= 7
+                if any(m["importance"] >= 7 for m in memories):
+                    logger.debug(
+                        "Eir: Skipping cluster %s — contains importance >= 7", cluster_key
+                    )
+                    continue
+
+                # Build summary from cluster
+                summaries = [m["content"][:200] for m in memories]
+                combined = (
+                    f"[Auto-compressed from {len(memories)} memories] "
+                    + "; ".join(summaries)
+                )
+
+                # Find the highest importance in the cluster, boost it slightly
+                max_importance = max(m["importance"] for m in memories)
+                new_importance = min(max_importance + 1, 10)  # Cap at 10
+
+                # Extract shared tags
+                all_tags = []
+                for m in memories:
+                    if m.get("tags"):
+                        try:
+                            tags = json_module.loads(m["tags"]) if isinstance(m["tags"], str) else m["tags"]
+                            all_tags.extend(tags)
+                        except (json_module.JSONDecodeError, TypeError):
+                            pass
+                # Keep unique tags, add auto_compressed marker
+                unique_tags = list(set(all_tags))[:10]  # Cap at 10 tags
+                unique_tags.append("auto_compressed")
+                unique_tags.append(f"cluster_{cluster_key}")
+
+                # Store as a semantic memory
+                try:
+                    cursor = mimir.execute(
+                        """INSERT INTO memories
+                           (content, category, importance, tags, memory_type, is_current,
+                            emotional_valence, timestamp)
+                           VALUES (?, ?, ?, ?, 'semantic', 1, 0.0,
+                                   datetime('now'))""",
+                        (combined, memories[0]["category"], new_importance,
+                         json_module.dumps(unique_tags)),
+                    )
+                    new_id = cursor.lastrowid
+
+                    # Mark originals as superseded
+                    for m in memories:
+                        mimir.execute(
+                            """UPDATE memories
+                               SET is_current = 0, superseded_by = ?
+                               WHERE id = ?""",
+                            (new_id, m["id"]),
+                        )
+
+                    results["compressed"] += 1
+                    results["memories_merged"] += len(memories)
+                    logger.info(
+                        "Eir: Compressed cluster %s (%d memories → 1 semantic, importance %d)",
+                        cluster_key, len(memories), new_importance,
+                    )
+                except Exception as e:
+                    results["errors"].append(f"Cluster {cluster_key}: {e}")
+
+            mimir.commit()
+        except Exception as e:
+            results["errors"].append(str(e))
+
+        return results
+
+    def _find_compression_candidates(self, mimir) -> dict:
+        """Find clusters of similar low-importance episodic memories.
+
+        Groups memories with:
+        - importance <= compress_max_importance (default 6)
+        - memory_type = 'episodic' (never compress semantic/procedural)
+        - is_current = 1 (don't re-compress already superseded memories)
+        - Similar category (grouping key)
+
+        Returns dict of {cluster_key: [memory_dicts]}.
+        """
+        from collections import defaultdict
+        import json
+
+        clusters = defaultdict(list)
+
+        try:
+            rows = mimir.execute("""
+                SELECT id, content, category, importance, tags, memory_type, timestamp
+                FROM memories
+                WHERE is_current = 1
+                  AND importance <= ?
+                  AND (memory_type = 'episodic' OR memory_type IS NULL)
+                  AND importance >= ?
+                ORDER BY category, timestamp
+            """, (self.config.compress_max_importance,
+                  self.config.compress_min_importance)).fetchall()
+        except Exception as e:
+            logger.warning("Eir: Compression candidate query failed: %s", e)
+            return {}
+
+        for row in rows:
+            memory = dict(row)
+            # Cluster key = category (simple grouping; could use embeddings later)
+            cluster_key = memory.get("category", "general")
+            clusters[cluster_key].append(memory)
+
+        # Filter clusters that are within the time window
+        if self.config.compress_window_days > 0:
+            filtered = defaultdict(list)
+            from datetime import datetime, timedelta
+
+            for cluster_key, memories in clusters.items():
+                # Sort by created_at
+                sorted_mems = sorted(
+                    memories,
+                    key=lambda m: m.get("timestamp", ""),
+                )
+                # Sliding window: group memories within window_days of each other
+                window = []
+                for mem in sorted_mems:
+                    try:
+                        created = datetime.fromisoformat(mem["timestamp"].replace("Z", "+00:00").replace("+00:00", ""))
+                    except (ValueError, AttributeError):
+                        # Can't parse date, include anyway
+                        window.append(mem)
+                        continue
+
+                    if window:
+                        try:
+                            earliest = datetime.fromisoformat(
+                                window[0].get("timestamp", "").replace("Z", "+00:00").replace("+00:00", "")
+                            )
+                            if (created - earliest).days > self.config.compress_window_days:
+                                # Window expired — flush and start new window
+                                if len(window) >= self.config.compress_min_cluster_size:
+                                    filtered[cluster_key].extend(window)
+                                window = [mem]
+                                continue
+                        except (ValueError, AttributeError):
+                            pass
+                    window.append(mem)
+
+                # Flush remaining window
+                if len(window) >= self.config.compress_min_cluster_size:
+                    filtered[cluster_key].extend(window)
+
+            return dict(filtered)
+
+        return dict(clusters)
 
     def consolidate(self) -> Dict[str, Any]:
         """Consolidate strong Hebbian connections into long-term paths.
@@ -472,6 +663,7 @@ class EirPipeline:
                 "decay_enabled": self.config.decay_enabled,
                 "promotion_enabled": self.config.promotion_enabled,
                 "dedup_enabled": self.config.dedup_enabled,
+                "compress_enabled": self.config.compress_enabled,
                 "consolidation_enabled": self.config.consolidation_enabled,
                 "backup_enabled": self.config.backup_enabled,
             },
